@@ -70,7 +70,7 @@ Embeds:
 
 Saves files using the structure:
 
-- <base_path>/<Artist>/<Album>/<Track Name>.<extension>
+- `<base_path>/<Artist>/<Album>/<Track Name>.<extension>`
 
 ---
 
