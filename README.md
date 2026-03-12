@@ -10,7 +10,8 @@
 
 ### 1. Subscribe to a Spotify Playlist
 Provide one or more Spotify playlist URLs as input.  
-The script treats them like subscriptions and keeps your local library in sync.
+The script treats them like subscriptions and keeps your local library in sync.  
+`Note: limited to 100 tracks due to Spotify's embed page cap.`
 
 ---
 
