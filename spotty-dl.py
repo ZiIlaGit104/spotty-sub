@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-spotty-dl.py -- Scrape a Spotify playlist (no API key/account required)
+spotty-sub.py -- Scrape a Spotify playlist (no API key/account required)
                  and download audio via yt-dlp with full metadata tagging.
+                 
+Note: limited to 100 tracks due to Spotify's embed page cap.
 
 Metadata sources (in priority order):
   1. Spotify playlist scraper (spotifyscraper) -- title, artist, year, artwork
@@ -19,11 +21,14 @@ Output structure (Plex-friendly):
           Track Title.mp3
 
 Requirements:
-    pip install spotifyscraper yt-dlp mutagen requests
+    Install Python package dependencies:
+      pip install spotifyscraper yt-dlp mutagen requests
+    Install ffmpeg and be sure it is in your path (Verify with "ffmpeg --version")
 
 Usage:
-    python spotty-dl.py "https://open.spotify.com/playlist/..."
-    python spotty-dl.py "..." --format flac --out D:/Music --sleep-min 10 --sleep-max 20
+    python spotty-sub.py "https://open.spotify.com/playlist/..."
+    python spotty-sub.py "..." --format flac --out D:/Music --sleep-min 10 --sleep-max 20
+    python spotty-sub.py "..." --format mp3 --out D:/Music --overwrite
 """
 
 import argparse
@@ -170,19 +175,27 @@ def best_image_url(images: list) -> str | None:
 
 # -- Spotify scraper ----------------------------------------------------------
 
+
+
 def scrape_playlist(url: str) -> tuple[str, list[dict]]:
     """
     Scrape playlist metadata via spotifyscraper.
-    Uses get_track_info() per track solely to get the best artwork URL —
-    album name is never reliably returned by Spotify and is resolved downstream.
+    Note: limited to 100 tracks due to Spotify's embed page cap.
+    Uses get_track_info() per track solely to get the best artwork URL.
     Returns (playlist_name, list of track dicts).
     """
     print(f"[spotify] Scraping playlist ...")
     client = SpotifyClient()
     try:
         playlist = client.get_playlist_info(url)
-        name     = playlist.get("name", "Unknown Playlist")
-        raw      = playlist.get("tracks", [])
+        name = playlist.get("name", "Unknown Playlist")
+        raw  = playlist.get("tracks", [])
+
+        total = playlist.get("track_count") or len(raw)
+        if len(raw) >= 100 and total >= 100:
+            print(f"[warn] Playlist has {total}+ tracks but only 100 can be scraped at a time.")
+            print(f"[warn] To process all tracks, split the playlist into chunks of <100 in Spotify.\n")
+
         print(f"[spotify] '{name}' -- {len(raw)} tracks\n")
 
         tracks = []
@@ -523,20 +536,74 @@ def build_ytdlp_opts(tmp_dir: str, fmt: str, quality: str, archive: str | None) 
     return opts
 
 
+_BAD_RESULT_RE  = re.compile(r'\b(live|cover|karaoke|tribute|remix|extended|instrumental|version|parody|reaction|tutorial)\b', re.I)
+_AUDIO_RE       = re.compile(r'\b(audio|lyrics?|official audio|full album)\b', re.I)
+
+
+def _score_result(info: dict, track: dict) -> int:
+    """Score a yt-dlp search result — higher is better."""
+    title    = info.get("title", "")
+    duration = info.get("duration") or 0
+    score    = 0
+
+    # Prefer audio/lyric uploads
+    if _AUDIO_RE.search(title):
+        score += 20
+
+    # Penalize live/cover/karaoke etc unless the track title itself contains those words
+    track_title = track.get("title", "")
+    if _BAD_RESULT_RE.search(title) and not _BAD_RESULT_RE.search(track_title):
+        score -= 30
+
+    # Prefer results whose duration is close to the known Spotify duration
+    expected_ms = track.get("duration_ms", 0)
+    if expected_ms and duration:
+        diff_sec = abs(duration - expected_ms / 1000)
+        if diff_sec < 5:
+            score += 20
+        elif diff_sec < 15:
+            score += 10
+        elif diff_sec > 60:
+            score -= 20
+
+    return score
+
+
 def search_and_download(track: dict, fmt: str, quality: str, archive: str | None) -> str | None:
     base_query  = f"{track['artist']} - {track['title']}"
-    album_query = f"{base_query} {track['album']}" if track["album"] else base_query
+    audio_query = f"{base_query} audio"
+    album_query = f"{base_query} {track['album']}" if track["album"] else None
 
     tmp_dir = tempfile.mkdtemp()
     opts    = build_ytdlp_opts(tmp_dir, fmt, quality, archive)
 
-    for query in dict.fromkeys([album_query, base_query]):
+    # Build ordered query list — audio query first, then album, then bare
+    queries = dict.fromkeys(q for q in [audio_query, album_query, base_query] if q)
+
+    for query in queries:
         try:
+            # Fetch top 5 candidates and pick the best scoring one
+            search_opts = {**opts, "quiet": True, "no_warnings": True, "skip_download": True,
+                           "extract_flat": False}
+            with yt_dlp.YoutubeDL(search_opts) as ydl:
+                results = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            candidates = (results or {}).get("entries") or []
+            if not candidates:
+                continue
+
+            best = max(candidates, key=lambda r: _score_result(r, track))
+            video_url = best.get("webpage_url") or best.get("url")
+            if not video_url:
+                continue
+
+            print(f"         yt: {best.get('title', '?')[:70]}")
+
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([f"ytsearch1:{query}"])
+                ydl.download([video_url])
             files = [f for f in os.listdir(tmp_dir) if not f.endswith(".part")]
             if files:
                 return os.path.join(tmp_dir, files[0])
+
         except Exception as e:
             print(f"  [warn] yt-dlp ({query!r}): {e}")
 
@@ -626,6 +693,23 @@ def tag_ogg(path: str, track: dict, art: bytes | None):
     audio.save()
 
 
+def _purge_archive_entry(archive_path: str, final_path: str) -> None:
+    """Remove any archive line whose filename matches the track's final path stem."""
+    if not archive_path or not os.path.exists(archive_path):
+        return
+    stem = os.path.splitext(os.path.basename(final_path))[0].lower()
+    try:
+        with open(archive_path, "r") as f:
+            lines = f.readlines()
+        kept = [l for l in lines if stem not in l.lower()]
+        if len(kept) < len(lines):
+            with open(archive_path, "w") as f:
+                f.writelines(kept)
+            print(f"         archive: removed {len(lines)-len(kept)} entr{'y' if len(lines)-len(kept)==1 else 'ies'}")
+    except Exception as e:
+        print(f"  [warn] Could not purge archive: {e}")
+
+
 def apply_tags(path: str, track: dict, art: bytes | None):
     ext = os.path.splitext(path)[1].lower()
     if   ext == ".mp3":            tag_mp3(path, track, art)
@@ -685,6 +769,9 @@ def main():
                         help="yt-dlp sleep between internal HTTP requests (seconds)")
     parser.add_argument("--archive", default=YTDLP_ARCHIVE,
                         help="yt-dlp archive file (empty string to disable)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Re-download and overwrite tracks that already exist, "
+                             "clearing their archive entries first")
     parser.add_argument("--discord", default=DISCORD_WEBHOOK_URL,
                         help="Discord webhook URL for run summary (empty to disable)")
     args = parser.parse_args()
@@ -742,11 +829,15 @@ def main():
         print(f"[{i:>3}/{len(ready)}] {track['artist']} - {track['title']}")
         print(f"         {track['album']}  |  track {trk}  |  {track.get('year') or '?'}")
 
-        # Skip if file already exists
+        # Skip if file already exists (unless --overwrite)
         if os.path.exists(final_path):
-            print(f"  [skip] Already exists\n")
-            skipped_existing += 1
-            continue
+            if not args.overwrite:
+                print(f"  [skip] Already exists\n")
+                skipped_existing += 1
+                continue
+            print(f"         overwrite: removing existing file")
+            os.remove(final_path)
+            _purge_archive_entry(archive, final_path)
 
         # Fetch art (cached per URL)
         art = None
