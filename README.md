@@ -2,7 +2,7 @@
 
 **Subscribe to Spotify playlists. Download tracks. Keep metadata clean.**
 
-`spotty-sub` scrapes Spotify playlist metadata and enriches it using MusicBrainz and Deezer, then downloads audio from YouTube and embeds full metadata and artwork into properly structured audio files.
+`spotty-sub` scrapes Spotify playlist metadata then downloads audio from YouTube and embeds full metadata and artwork into properly structured audio files.
 
 ---
 
@@ -11,7 +11,6 @@
 ### 1. Subscribe to a Spotify Playlist
 Provide one or more Spotify playlist URLs as input.  
 The script treats them like subscriptions and keeps your local library in sync.  
-`Note: limited to 100 tracks due to Spotify's embed page cap.`
 
 ---
 
@@ -20,37 +19,14 @@ The script treats them like subscriptions and keeps your local library in sync.
 Uses `spotifyscraper` to collect:
 
 - Artist name  
-- Track name  
-- Album artwork  
+- Track name
+- Track number
+- Album artwork
+- Album name 
 
 ---
 
-### 3. Resolve Missing Album Metadata (3-Tier Fallback System)
-
-Spotify’s web UI does not reliably expose album metadata, so `spotty-sub` performs a multi-step enrichment process:
-
-#### Tier 1 — MusicBrainz Direct Lookup
-- Uses the Spotify track URL to query the MusicBrainz public API
-- Attempts to match the track to a release
-- Retrieves:
-  - Album name
-  - Release year
-  - Track number
-
-#### Tier 2 — Deezer API Fallback
-- Searches Deezer’s public API using artist + track name
-- Attempts to match and extract missing metadata
-
-#### Tier 3 — MusicBrainz Fuzzy Match
-- Performs fuzzy matching on MusicBrainz
-- Attempts to associate the track with:
-  - Debut album
-  - Single release
-- Avoids compilation albums when possible
-
----
-
-### 4. Download Audio from YouTube
+### 3. Download Audio from YouTube
 
 - Uses `yt-dlp` to search for the track on YouTube
 - Downloads the video
@@ -59,7 +35,7 @@ Spotify’s web UI does not reliably expose album metadata, so `spotty-sub` perf
 
 ---
 
-### 5. Embed Metadata & Organize Files
+### 4. Embed Metadata & Organize Files
 
 Embeds:
 
@@ -75,7 +51,7 @@ Saves files using the structure:
 
 ---
 
-### 6. Discord Notifications (Optional)
+### 5. Discord Notifications (Optional)
 
 - Sends status updates when tracks are downloaded
 
@@ -83,12 +59,12 @@ Saves files using the structure:
 
 ## 🧠 Smart Features
 
-- API throttling / sleep timers (to respect YouTube, Deezer, MusicBrainz)
+- API throttling / sleep timers (to respect YouTube/Spotify)
 - Skips already-downloaded tracks
   - Maintains a YouTube archive file
   - Checks destination path for existing file matches
 - Designed for automation
-  - Works with Cron (Linux/macOS)
+  - Works with CRON (Linux/macOS)
   - Works with Windows Task Scheduler
 
 ---
