@@ -1,34 +1,24 @@
 #!/usr/bin/env python3
 """
-spotty-sub.py -- Scrape a Spotify playlist (no API key/account required)
-                 and download audio via yt-dlp with full metadata tagging.
-                 
-Note: limited to 100 tracks due to Spotify's embed page cap.
+spotty-sub.py -- Scrape a Spotify playlist and download audio via yt-dlp
+                with clean ID3/Vorbis metadata embedded directly.
 
-Metadata sources (in priority order):
-  1. Spotify playlist scraper (spotifyscraper) -- title, artist, year, artwork
-  2. MusicBrainz reverse Spotify URL lookup    -- album, track#, ISRC
-  3. Deezer search API                         -- album fallback (no auth needed)
-  4. MusicBrainz title/artist search           -- last resort, compilations excluded
-
-Tracks with no resolvable album are SKIPPED and reported in the Discord summary
-so they can be retried later when metadata improves.
+Metadata is retrieved directly from Spotify (title, artist, album, year, artwork).
 
 Output structure (Plex-friendly):
     <out>/
       Artist Name/
         Album Name/
-          Track Title.mp3
+          Track Title.ext
 
 Requirements:
-    Install Python package dependencies:
-      pip install spotifyscraper yt-dlp mutagen requests
-    Install ffmpeg and be sure it is in your path (Verify with "ffmpeg --version")
+    pip install spotifyscraper yt-dlp mutagen requests
+    ffmpeg installed in system PATH (Verify with "ffmpeg --version")
 
 Usage:
     python spotty-sub.py "https://open.spotify.com/playlist/..."
-    python spotty-sub.py "..." --format flac --out D:/Music --sleep-min 10 --sleep-max 20
-    python spotty-sub.py "..." --format mp3 --out D:/Music --overwrite
+    python spotty-sub.py "..." --format flac --out /music --sleep-min 10 --sleep-max 20
+    python spotty-sub.py "..." --format mp3 --out /music --overwrite
 """
 
 import argparse
@@ -36,7 +26,6 @@ import os
 import sys
 import re
 import time
-import random
 import tempfile
 import shutil
 import requests
@@ -50,7 +39,7 @@ logging.getLogger("spotify_scraper").setLevel(logging.WARNING)
 # =============================================================================
 
 # Discord webhook URL for run summaries. Set to None or "" to disable.
-DISCORD_WEBHOOK_URL  = ""
+DISCORD_WEBHOOK_URL  = "https://discord.com/api/webhooks/YOUR_WEBHOOK_URL"
 
 # yt-dlp: min/max seconds to sleep between downloads (random value chosen each time)
 YTDLP_SLEEP_MIN      = 24.6
@@ -59,15 +48,11 @@ YTDLP_SLEEP_MAX      = 47.8
 # yt-dlp: seconds to sleep between individual internal HTTP requests
 YTDLP_SLEEP_REQUESTS = 2.4
 
-# yt-dlp: path to download archive file. Tracks already-downloaded video IDs
-# so re-runs skip them automatically. Set to "" to disable.
+# yt-dlp: path to download archive file. Set to "" to disable.
 YTDLP_ARCHIVE        = "./yt-dlp-downloaded.txt"
 
-# Spotify scraper: seconds to sleep between per-track API/page calls
+# Spotify scraper: seconds to sleep between per-track API calls
 SPOTIFY_TRACK_DELAY  = 0.5
-
-# MusicBrainz: seconds to sleep after each API call (their limit is 1 req/sec)
-MB_RATE_LIMIT_DELAY  = 1.1
 
 # Main loop: extra seconds to wait between tracks on top of yt-dlp's own sleep
 DOWNLOAD_LOOP_DELAY  = 1.5
@@ -86,7 +71,7 @@ try:
 except ImportError:
     missing.append("yt-dlp")
 try:
-    from mutagen.id3 import (ID3, TIT2, TPE1, TPE2, TALB, TRCK, TDRC,
+    from mutagen.id3 import (ID3, TIT2, TPE1, TPE2, TALB, TRCK, TDRC, TYER,
                               TPOS, APIC, TCON, TSRC, ID3NoHeaderError)
     from mutagen.mp4 import MP4, MP4Cover
     from mutagen.flac import FLAC, Picture
@@ -122,7 +107,6 @@ def build_discord_summary(
     playlist_name: str,
     ok: int,
     skipped_existing: int,
-    skipped_no_album: int,
     failed: int,
     errors: list[str],
 ) -> str:
@@ -131,13 +115,12 @@ def build_discord_summary(
         f"",
         f"✅  Downloaded:        {ok}",
         f"⏭️  Skipped (exists):  {skipped_existing}",
-        f"⚠️  Skipped (no album): {skipped_no_album}",
         f"❌  Failed:            {failed}",
     ]
     if errors:
         lines.append("")
         lines.append("**Unexpected errors:**")
-        for e in errors[:10]:   # cap at 10 to avoid hitting Discord's 2000 char limit
+        for e in errors[:10]:
             lines.append(f"• {e}")
         if len(errors) > 10:
             lines.append(f"• ... and {len(errors) - 10} more")
@@ -175,336 +158,132 @@ def best_image_url(images: list) -> str | None:
 
 # -- Spotify scraper ----------------------------------------------------------
 
-
-
 def scrape_playlist(url: str) -> tuple[str, list[dict]]:
-    """
-    Scrape playlist metadata via spotifyscraper.
-    Note: limited to 100 tracks due to Spotify's embed page cap.
-    Uses get_track_info() per track solely to get the best artwork URL.
-    Returns (playlist_name, list of track dicts).
-    """
+    """Scrape full playlist metadata via spotifyscraper."""
     print(f"[spotify] Scraping playlist ...")
     client = SpotifyClient()
     try:
-        playlist = client.get_playlist_info(url)
-        name = playlist.get("name", "Unknown Playlist")
-        raw  = playlist.get("tracks", [])
-
-        total = playlist.get("track_count") or len(raw)
-        if len(raw) >= 100 and total >= 100:
-            print(f"[warn] Playlist has {total}+ tracks but only 100 can be scraped at a time.")
-            print(f"[warn] To process all tracks, split the playlist into chunks of <100 in Spotify.\n")
-
+        playlist = client.get_playlist(url, max_tracks=None)
+        name = getattr(playlist, "name", None) or getattr(playlist, "title", "Unknown Playlist")
+        raw = getattr(playlist, "tracks", []) or []
         print(f"[spotify] '{name}' -- {len(raw)} tracks\n")
-
         tracks = []
         for i, item in enumerate(raw, 1):
-            t = item.get("track") or item
-            if not t or not t.get("name"):
-                continue
+            t_obj = getattr(item, "track", item)
 
-            artists  = t.get("artists") or []
-            album    = t.get("album") or {}
-            images   = album.get("images") or t.get("images") or []
-            release  = album.get("release_date") or t.get("release_date") or ""
-            ext_ids  = t.get("external_ids") or {}
+            if hasattr(t_obj, "to_dict"):
+                t = t_obj.to_dict()
+            elif hasattr(t_obj, "__dict__"):
+                t = vars(t_obj)
+            elif isinstance(t_obj, dict):
+                t = t_obj
+            else:
+                t = {}
 
-            track_id  = t.get("id") or (
-                t.get("uri", "").split(":")[-1] if t.get("uri") else None
-            )
+            title = t.get("name") or t.get("title") or "Unknown Title"
+
+            album_val = t.get("album")
+            if isinstance(album_val, str):
+                album_name = album_val
+                album_dict = {}
+            elif hasattr(album_val, "to_dict"):
+                album_dict = album_val.to_dict()
+                album_name = album_dict.get("name") or album_dict.get("title") or "Unknown Album"
+            elif isinstance(album_val, dict):
+                album_dict = album_val
+                album_name = album_dict.get("name") or album_dict.get("title") or "Unknown Album"
+            else:
+                album_dict = {}
+                album_name = "Unknown Album"
+
+            release_date = t.get("release_date") or album_dict.get("release_date") or ""
+
+            raw_artists = t.get("artists") or t.get("artist") or album_dict.get("artists") or []
+            artist_list = []
+
+            if isinstance(raw_artists, list):
+                for a in raw_artists:
+                    if isinstance(a, dict):
+                        a_name = a.get("name") or a.get("title")
+                    elif hasattr(a, "name"):
+                        a_name = getattr(a, "name")
+                    elif isinstance(a, str):
+                        a_name = a
+                    else:
+                        a_name = None
+
+                    if a_name:
+                        artist_list.append(str(a_name).strip())
+            elif isinstance(raw_artists, str):
+                artist_list = [raw_artists.strip()]
+
+            artist_list = [a for a in artist_list if a]
+            main_artist = artist_list[0] if artist_list else "Unknown Artist"
+            all_artists = ", ".join(artist_list)
+
+            images = t.get("images") or album_dict.get("images") or []
+            formatted_images = []
+            if isinstance(images, list):
+                for img in images:
+                    if isinstance(img, dict):
+                        formatted_images.append(img)
+                    elif hasattr(img, "to_dict"):
+                        formatted_images.append(img.to_dict())
+                    elif hasattr(img, "__dict__"):
+                        formatted_images.append(vars(img))
+
+            ext_ids = t.get("external_ids") or {}
+            if hasattr(ext_ids, "to_dict"):
+                ext_ids = ext_ids.to_dict()
+
+            track_id = t.get("id")
+            if not track_id and t.get("uri"):
+                track_id = str(t.get("uri")).split(":")[-1]
             track_url = f"https://open.spotify.com/track/{track_id}" if track_id else None
 
+            isrc_val = ext_ids.get("isrc") if isinstance(ext_ids, dict) else None
+
             track = {
-                "title":        t.get("name", "Unknown Title"),
-                "artist":       artists[0].get("name", "Unknown Artist") if artists else "Unknown Artist",
-                "all_artists":  ", ".join(a.get("name", "") for a in artists if a.get("name")),
-                "album":        album.get("name") or "",
-                "year":         release[:4] if release else "",
+                "title":        title,
+                "artist":       main_artist,
+                "all_artists":  all_artists,
+                "album":        album_name,
+                "year":         str(release_date)[:4] if release_date else "",
                 "track_number": t.get("track_number"),
-                "total_tracks": album.get("total_tracks"),
+                "total_tracks": album_dict.get("total_tracks"),
                 "disc_number":  t.get("disc_number"),
                 "genre":        ", ".join(t.get("genres") or []),
-                "isrc":         ext_ids.get("isrc"),
-                "art_url":      best_image_url(images),
+                "isrc":         isrc_val,
+                "art_url":      best_image_url(formatted_images),
                 "duration_ms":  t.get("duration_ms", 0),
                 "spotify_url":  track_url,
             }
 
-            # Fetch per-track info solely to get the best artwork URL
             if track_url:
                 try:
-                    full = client.get_track_info(track_url)
-                    if full:
-                        f_images = (full.get("album") or {}).get("images") or full.get("images") or []
-                        if f_images:
-                            better = best_image_url(f_images)
-                            if better:
-                                track["art_url"] = better
-                except Exception as e:
-                    print(f"  [warn] get_track_info failed for artwork: {e}")
+                    full = client.get_track(track_url)
+                    full_dict = full.to_dict() if hasattr(full, "to_dict") else (vars(full) if hasattr(full, "__dict__") else {})
+                    f_album = full_dict.get("album") or {}
+                    if hasattr(f_album, "to_dict"):
+                        f_album = f_album.to_dict()
+                    f_imgs = full_dict.get("images") or (f_album.get("images") if isinstance(f_album, dict) else []) or []
+                    if f_imgs:
+                        fmt_f_imgs = [i.to_dict() if hasattr(i, "to_dict") else (vars(i) if hasattr(i, "__dict__") else i) for i in f_imgs]
+                        better = best_image_url(fmt_f_imgs)
+                        if better:
+                            track["art_url"] = better
+                except Exception:
+                    pass
 
             time.sleep(SPOTIFY_TRACK_DELAY)
             tracks.append(track)
-            print(f"  [{i:>3}/{len(raw)}] {track['artist']} - {track['title']}"
-                  + (f"  [{track['album']}]" if track["album"] else ""))
+            print(f"  [{i:>3}/{len(raw)}] {track['artist']} - {track['title']}  [{track['album']}]")
 
     finally:
         client.close()
 
     print(f"\n[spotify] Done.\n")
     return name, tracks
-
-
-# -- MusicBrainz fallback -----------------------------------------------------
-
-MB_BASE    = "https://musicbrainz.org/ws/2"
-MB_HEADERS = {"User-Agent": "spotify-dl/2.0 (https://github.com/local/spotify-dl)"}
-_VIDEO_RE  = re.compile(r'\b(lyric|video|karaoke|instrumental|live|acoustic|demo|remix)\b', re.I)
-_COMP_RE   = re.compile(r'\b(compilation|greatest hits|best of|collection|anthology|various)\b', re.I)
-
-
-def _release_score(release: dict) -> int:
-    rg      = release.get("release-group") or {}
-    ptype   = rg.get("primary-type", "")
-    stypes  = [s.lower() for s in (rg.get("secondary-types") or [])]
-    disamb  = release.get("disambiguation", "") or ""
-    title   = release.get("title", "") or ""
-
-    # Base score: prefer Album > EP > Single > unknown
-    score = {"Album": 30, "EP": 20, "Single": 10}.get(ptype, 0)
-
-    # Heavily penalize compilations and soundtracks
-    if "compilation" in stypes:
-        score -= 60
-    if "soundtrack" in stypes:
-        score -= 40
-    if "mixtape/street" in stypes or "demo" in stypes:
-        score -= 30
-
-    # Penalize if title or disambiguation suggests a compilation/various artists release
-    if _COMP_RE.search(title) or _COMP_RE.search(disamb):
-        score -= 50
-
-    # Penalize video/live/karaoke releases
-    if _VIDEO_RE.search(disamb) or _VIDEO_RE.search(title):
-        score -= 50
-
-    return score
-
-def _mb_recording_from_spotify_url(track_url: str) -> dict | None:
-    """
-    Query MusicBrainz URL relationship index with the Spotify track URL.
-    Returns the first matching recording dict, or None.
-    """
-    try:
-        params = {"resource": track_url, "inc": "recording-rels", "fmt": "json"}
-        r = requests.get(f"{MB_BASE}/url", params=params, headers=MB_HEADERS, timeout=15)
-        time.sleep(MB_RATE_LIMIT_DELAY)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        # Follow relation to recording
-        for rel in data.get("relations", []):
-            recording = rel.get("recording")
-            if recording:
-                # Fetch full recording with releases
-                rec_id = recording.get("id")
-                if not rec_id:
-                    continue
-                r2 = requests.get(
-                    f"{MB_BASE}/recording/{rec_id}",
-                    params={"inc": "releases+release-groups+isrcs+release-group-rels", "fmt": "json"},
-                    headers=MB_HEADERS, timeout=15,
-                )
-                time.sleep(MB_RATE_LIMIT_DELAY)
-                if r2.status_code == 200:
-                    return r2.json()
-    except Exception as e:
-        print(f"  [warn] MusicBrainz Spotify URL lookup failed: {e}")
-    return None
-
-
-def _mb_lookup_by_spotify_url(track_url: str) -> dict:
-    """Pass 1: MusicBrainz reverse Spotify URL lookup. Returns result dict or {}."""
-    result = {}
-    try:
-        recording = _mb_recording_from_spotify_url(track_url)
-        if not recording:
-            return result
-
-        print(f"           MusicBrainz matched via Spotify URL")
-        isrcs = recording.get("isrcs", [])
-        if isrcs:
-            result["isrc"] = isrcs[0]
-
-        releases = recording.get("releases", [])
-        if not releases:
-            return result
-
-        best = max(releases, key=_release_score)
-        if _release_score(best) < 0:
-            print(f"           MB-URL: best release is a compilation, rejecting")
-            return result
-
-        rg = best.get("release-group") or {}
-        if rg.get("title"):
-            result["album"] = rg["title"]
-
-        for media in best.get("media", []):
-            trks = media.get("track", [])
-            if trks:
-                num = trks[0].get("number")
-                if num is not None:
-                    try:    result["track_number"] = int(num)
-                    except: result["track_number"] = num
-                if media.get("track-count"):
-                    result["total_tracks"] = media["track-count"]
-                break
-
-    except Exception as e:
-        print(f"  [warn] MB Spotify URL lookup failed: {e}")
-
-    return result
-
-
-def _mb_lookup_by_search(artist: str, title: str, isrc: str | None) -> dict:
-    """Pass 3: MusicBrainz title/artist or ISRC search. Last resort.
-    Strictly rejects compilations — only accepts positive-scoring releases."""
-    result = {}
-    try:
-        params = (
-            {"query": f"isrc:{isrc}", "inc": "releases+release-groups+isrcs",
-             "fmt": "json", "limit": 10}
-            if isrc else
-            {"query": f'recording:"{title}" AND artist:"{artist}"',
-             "inc": "releases+release-groups+isrcs", "fmt": "json", "limit": 10}
-        )
-        r = requests.get(f"{MB_BASE}/recording", params=params,
-                         headers=MB_HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        time.sleep(MB_RATE_LIMIT_DELAY)
-
-        recordings = data.get("recordings", [])
-        if not recordings:
-            return result
-
-        recording = max(recordings, key=lambda x: x.get("score", 0))
-        isrcs = recording.get("isrcs", [])
-        if isrcs:
-            result["isrc"] = isrcs[0]
-
-        releases = recording.get("releases", [])
-        if not releases:
-            return result
-
-        # Strictly exclude compilations
-        clean = [rel for rel in releases if _release_score(rel) > 0]
-        if not clean:
-            print(f"           MB-search: all releases are compilations/junk, rejecting")
-            return result
-
-        best = max(clean, key=_release_score)
-        rg = best.get("release-group") or {}
-        if rg.get("title"):
-            result["album"] = rg["title"]
-
-        for media in best.get("media", []):
-            trks = media.get("track", [])
-            if trks:
-                num = trks[0].get("number")
-                if num is not None:
-                    try:    result["track_number"] = int(num)
-                    except: result["track_number"] = num
-                if media.get("track-count"):
-                    result["total_tracks"] = media["track-count"]
-                break
-
-    except Exception as e:
-        print(f"  [warn] MB search lookup failed: {e}")
-
-    return result
-
-
-def deezer_lookup(artist: str, title: str) -> dict:
-    """Pass 2: Deezer public API search. No auth required."""
-    result = {}
-    try:
-        r = requests.get(
-            "https://api.deezer.com/search/track",
-            params={"q": f'artist:"{artist}" track:"{title}"'},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        if not data:
-            r = requests.get(
-                "https://api.deezer.com/search/track",
-                params={"q": f"{artist} {title}"},
-                timeout=15,
-            )
-            r.raise_for_status()
-            data = r.json().get("data", [])
-        if not data:
-            return result
-
-        artist_lower = artist.lower()
-        hit = next(
-            (t for t in data if t.get("artist", {}).get("name", "").lower() == artist_lower),
-            data[0]
-        )
-        album = hit.get("album", {})
-        if album.get("title"):
-            result["album"] = album["title"]
-        if hit.get("isrc"):
-            result["isrc"] = hit["isrc"]
-
-    except Exception as e:
-        print(f"  [warn] Deezer lookup failed: {e}")
-
-    return result
-
-
-def enrich_missing_from_musicbrainz(tracks: list[dict]) -> None:
-    needs_enrich = [t for t in tracks if not t["album"] or t["track_number"] is None]
-    if not needs_enrich:
-        print("[info] All tracks have complete metadata -- skipping enrichment.\n")
-        return
-
-    print(f"[enrich] Querying {len(needs_enrich)} track(s) ...\n")
-    for t in needs_enrich:
-        print(f"  {t['artist']} - {t['title']}")
-        changed = []
-
-        def _apply(res: dict, tag: str) -> None:
-            if res.get("album") and not t["album"]:
-                t["album"] = res["album"];                  changed.append(f"album='{res['album']}' [{tag}]")
-            if res.get("track_number") is not None and t["track_number"] is None:
-                t["track_number"] = res["track_number"];    changed.append(f"track#={res['track_number']}")
-            if res.get("total_tracks") is not None and t["total_tracks"] is None:
-                t["total_tracks"] = res["total_tracks"];    changed.append(f"total={res['total_tracks']}")
-            if res.get("isrc") and not t.get("isrc"):
-                t["isrc"] = res["isrc"];                    changed.append(f"isrc={res['isrc']}")
-
-        def _needs_more() -> bool:
-            return not t["album"] or t["track_number"] is None
-
-        # Pass 1: MusicBrainz reverse Spotify URL lookup (exact match)
-        # Returns album + track# when available
-        if _needs_more() and t.get("spotify_url"):
-            _apply(_mb_lookup_by_spotify_url(t["spotify_url"]), "MB-URL")
-
-        # Pass 2: Deezer — good for album name, does not return track#
-        if not t["album"]:
-            _apply(deezer_lookup(t["artist"], t["title"]), "Deezer")
-
-        # Pass 3: MusicBrainz title/artist search — no compilations
-        # Always run if track# is still missing (even if album was found above)
-        if _needs_more():
-            _apply(_mb_lookup_by_search(t["artist"], t["title"], t.get("isrc")), "MB-search")
-
-        print(f"  -> {', '.join(changed) if changed else 'nothing new found'}\n")
 
 
 # -- yt-dlp -------------------------------------------------------------------
@@ -546,16 +325,13 @@ def _score_result(info: dict, track: dict) -> int:
     duration = info.get("duration") or 0
     score    = 0
 
-    # Prefer audio/lyric uploads
     if _AUDIO_RE.search(title):
         score += 20
 
-    # Penalize live/cover/karaoke etc unless the track title itself contains those words
     track_title = track.get("title", "")
     if _BAD_RESULT_RE.search(title) and not _BAD_RESULT_RE.search(track_title):
         score -= 30
 
-    # Prefer results whose duration is close to the known Spotify duration
     expected_ms = track.get("duration_ms", 0)
     if expected_ms and duration:
         diff_sec = abs(duration - expected_ms / 1000)
@@ -577,12 +353,10 @@ def search_and_download(track: dict, fmt: str, quality: str, archive: str | None
     tmp_dir = tempfile.mkdtemp()
     opts    = build_ytdlp_opts(tmp_dir, fmt, quality, archive)
 
-    # Build ordered query list — audio query first, then album, then bare
     queries = dict.fromkeys(q for q in [audio_query, album_query, base_query] if q)
 
     for query in queries:
         try:
-            # Fetch top 5 candidates and pick the best scoring one
             search_opts = {**opts, "quiet": True, "no_warnings": True, "skip_download": True,
                            "extract_flat": False}
             with yt_dlp.YoutubeDL(search_opts) as ydl:
@@ -630,7 +404,10 @@ def tag_mp3(path: str, track: dict, art: bytes | None):
     s(TPE1(encoding=3, text=track["artist"]))
     s(TPE2(encoding=3, text=track["all_artists"]))
     if track.get("album"):       s(TALB(encoding=3, text=track["album"]))
-    if track.get("year"):        s(TDRC(encoding=3, text=track["year"]))
+    if track.get("year"):
+        year = str(track["year"]).strip()
+        s(TDRC(encoding=3, text=year))
+        s(TYER(encoding=3, text=year))
     trck = _trck_str(track)
     if trck:                     s(TRCK(encoding=3, text=trck))
     if track.get("disc_number"): s(TPOS(encoding=3, text=str(track["disc_number"])))
@@ -650,7 +427,7 @@ def tag_m4a(path: str, track: dict, art: bytes | None):
     tags["\xa9ART"] = [track["artist"]]
     tags["aART"]    = [track["all_artists"]]
     if track.get("album"):       tags["\xa9alb"] = [track["album"]]
-    if track.get("year"):        tags["\xa9day"] = [track["year"]]
+    if track.get("year"):        tags["\xa9day"] = [str(track["year"]).strip()]
     if track.get("track_number") is not None:
         total = int(track["total_tracks"]) if track.get("total_tracks") else 0
         tags["trkn"] = [(int(track["track_number"]), total)]
@@ -666,7 +443,10 @@ def tag_flac(path: str, track: dict, art: bytes | None):
     audio["artist"]      = track["artist"]
     audio["albumartist"] = track["all_artists"]
     if track.get("album"):        audio["album"]       = track["album"]
-    if track.get("year"):         audio["date"]        = track["year"]
+    if track.get("year"):
+        year = str(track["year"]).strip()
+        audio["date"]        = year
+        audio["year"]        = year
     if track.get("track_number") is not None:
         audio["tracknumber"] = str(track["track_number"])
         if track.get("total_tracks") is not None:
@@ -686,7 +466,10 @@ def tag_ogg(path: str, track: dict, art: bytes | None):
     audio["artist"]      = [track["artist"]]
     audio["albumartist"] = [track["all_artists"]]
     if track.get("album"):        audio["album"]       = [track["album"]]
-    if track.get("year"):         audio["date"]        = [track["year"]]
+    if track.get("year"):
+        year = str(track["year"]).strip()
+        audio["date"]        = [year]
+        audio["year"]        = [year]
     if track.get("track_number") is not None:
         audio["tracknumber"] = [str(track["track_number"])]
     if track.get("genre"):        audio["genre"]       = [track["genre"]]
@@ -722,9 +505,8 @@ def apply_tags(path: str, track: dict, art: bytes | None):
 # -- Plex folder layout -------------------------------------------------------
 
 def primary_artist(name: str) -> str:
-    """Strip featured/contributing artists from a name string for use in folder paths.
-    e.g. 'Charlie Puth, Selena Gomez' → 'Charlie Puth'
-         'Drake ft. Future'           → 'Drake'
+    """Strip featured/contributing artists for folder layout.
+    e.g. 'Charlie Puth, Selena Gomez' -> 'Charlie Puth'
     """
     name = re.split(r'\s*[,&]\s*|\s+f(?:ea)?t\.?\s+|\s+with\s+', name, maxsplit=1)[0]
     return name.strip()
@@ -733,7 +515,7 @@ def primary_artist(name: str) -> str:
 def plex_path(base_dir: str, track: dict, fmt: str) -> str:
     """base_dir / Artist / Album / Track Title.ext"""
     artist   = sanitize(primary_artist(track["artist"] or "Unknown Artist"))
-    album    = sanitize(track["album"])   # caller guarantees non-empty
+    album    = sanitize(track["album"] or "Unknown Album")
     filename = f"{sanitize(track['title'])}.{fmt}"
     return os.path.join(base_dir, artist, album, filename)
 
@@ -744,7 +526,7 @@ def main():
     global YTDLP_SLEEP_MIN, YTDLP_SLEEP_MAX, YTDLP_SLEEP_REQUESTS
 
     parser = argparse.ArgumentParser(
-        description="Download a Spotify playlist via YouTube with full Plex-friendly metadata.",
+        description="Download a Spotify playlist via YouTube with direct Spotify metadata.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("url",
@@ -770,8 +552,7 @@ def main():
     parser.add_argument("--archive", default=YTDLP_ARCHIVE,
                         help="yt-dlp archive file (empty string to disable)")
     parser.add_argument("--overwrite", action="store_true",
-                        help="Re-download and overwrite tracks that already exist, "
-                             "clearing their archive entries first")
+                        help="Re-download and overwrite tracks that already exist")
     parser.add_argument("--discord", default=DISCORD_WEBHOOK_URL,
                         help="Discord webhook URL for run summary (empty to disable)")
     args = parser.parse_args()
@@ -794,42 +575,28 @@ def main():
         print(f"[info] Discord notifications: enabled")
     print()
 
-    # 1. Scrape Spotify playlist metadata
+    # 1. Scrape Spotify playlist metadata directly
     playlist_name, tracks = scrape_playlist(args.url)
 
-    # 2. Enrich missing albums via MusicBrainz (Spotify URL) → Deezer → MusicBrainz search
-    enrich_missing_from_musicbrainz(tracks)
-
-    # 3. Split tracks: those with album info proceed, those without are deferred
-    ready    = [t for t in tracks if t["album"]]
-    deferred = [t for t in tracks if not t["album"]]
-
-    if deferred:
-        print(f"[warn] {len(deferred)} track(s) have no resolvable album and will be SKIPPED:")
-        for t in deferred:
-            print(f"       - {t['artist']} - {t['title']}")
-        print()
-
-    print(f"[info] Downloading {len(ready)} tracks to: {out_dir}")
+    print(f"[info] Downloading {len(tracks)} tracks to: {out_dir}")
     print(f"[info] Structure:  Artist / Album / Title.{args.format}\n")
 
     ok = 0
-    skipped_existing  = 0
-    skipped_no_album  = len(deferred)
+    skipped_existing = 0
     failed = 0
     errors: list[str] = []
     art_cache: dict[str, bytes | None] = {}
 
-    for i, track in enumerate(ready, 1):
+    for i, track in enumerate(tracks, 1):
         final_path = plex_path(out_dir, track, args.format)
         album_dir  = os.path.dirname(final_path)
 
         trk = (f"{track['track_number']}/{track['total_tracks']}"
                if track.get("total_tracks") else str(track.get("track_number") or "?"))
-        print(f"[{i:>3}/{len(ready)}] {track['artist']} - {track['title']}")
+        print(f"[{i:>3}/{len(tracks)}] {track['artist']} - {track['title']}")
         print(f"         {track['album']}  |  track {trk}  |  {track.get('year') or '?'}")
 
-        # Skip if file already exists (unless --overwrite)
+        # Skip if file exists (unless --overwrite)
         if os.path.exists(final_path):
             if not args.overwrite:
                 print(f"  [skip] Already exists\n")
@@ -839,7 +606,7 @@ def main():
             os.remove(final_path)
             _purge_archive_entry(archive, final_path)
 
-        # Fetch art (cached per URL)
+        # Fetch art
         art = None
         if not args.no_art and track.get("art_url"):
             key = track["art_url"]
@@ -888,15 +655,14 @@ def main():
         print(f"  [ ok] {os.path.relpath(final_path, out_dir)}\n")
         ok += 1
 
-        if args.delay > 0 and i < len(ready):
+        if args.delay > 0 and i < len(tracks):
             time.sleep(args.delay)
 
     # Summary
     print("-" * 55)
-    print(f"  Downloaded:         {ok}")
-    print(f"  Skipped (exists):   {skipped_existing}")
-    print(f"  Skipped (no album): {skipped_no_album}")
-    print(f"  Failed:             {failed}")
+    print(f"  Downloaded:       {ok}")
+    print(f"  Skipped (exists): {skipped_existing}")
+    print(f"  Failed:           {failed}")
     print(f"  Root: {out_dir}")
     if archive and os.path.exists(archive):
         with open(archive) as f:
@@ -905,14 +671,8 @@ def main():
     # Discord notification
     if discord_url:
         summary = build_discord_summary(
-            playlist_name, ok, skipped_existing, skipped_no_album, failed, errors
+            playlist_name, ok, skipped_existing, failed, errors
         )
-        # Append skipped-no-album track list if any
-        if deferred:
-            track_list = "\n".join(
-                f"  • {t['artist']} - {t['title']}" for t in deferred
-            )
-            summary += f"\n\n**Skipped (no album found):**\n{track_list}"
         discord_notify(discord_url, summary)
         print("\n[info] Discord summary sent.")
 
